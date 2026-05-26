@@ -105,8 +105,16 @@ runs:
       id: recommend
       shell: bash
       env:
+        # GITHUB_TOKEN: always set from the workflow's built-in token,
+        # which works for same-repo installs. Cross-repo controllers
+        # override via INPUT_GITHUB_TOKEN below; run.py prefers that
+        # when set. (Two env vars, not `${{ a || b }}`, because the
+        # GitHub Actions || operator evaluates empty-string inputs in
+        # a way that returns '' rather than falling through to the
+        # right operand — observed via the v1.0.3 push failure.)
+        GITHUB_TOKEN: ${{ github.token }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
         TARGET_REPO: ${{ github.repository }}
-        GITHUB_TOKEN: ${{ inputs.github-token || github.token }}
         INPUT_INTEREST_ID: ${{ inputs.interest-id }}
         INPUT_MIN_CONFIDENCE: ${{ inputs.min-confidence }}
         INPUT_DRAFT_MODE: ${{ inputs.draft-mode }}

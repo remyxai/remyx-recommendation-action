@@ -388,9 +388,35 @@ class Recommendation:
 # ─── Helpers ───────────────────────────────────────────────────────────────
 
 
+def _github_token() -> str:
+    """Resolve the GitHub token to use for git push + API calls.
+
+    Preference order:
+      1. INPUT_GITHUB_TOKEN — explicit cross-repo PAT override
+      2. GITHUB_TOKEN — the workflow's built-in token (action.yml's
+         step env sets this from `${{ github.token }}`).
+
+    Two separate env vars rather than a single `${{ a || b }}` in
+    action.yml because GitHub Actions' || operator on empty-string
+    inputs returns '' instead of falling through (observed via v1.0.3
+    git-push failure). Resolving in Python gives reliable semantics.
+    """
+    return (
+        os.environ.get("INPUT_GITHUB_TOKEN", "").strip()
+        or os.environ.get("GITHUB_TOKEN", "").strip()
+    )
+
+
 def gh_api(method: str, path: str, body: dict | None = None) -> Any:
     """Minimal GitHub API wrapper."""
-    token = os.environ["GITHUB_TOKEN"]
+    token = _github_token()
+    if not token:
+        raise RuntimeError(
+            "Neither INPUT_GITHUB_TOKEN nor GITHUB_TOKEN is set. The "
+            "action.yml should pass ${{ github.token }} as GITHUB_TOKEN "
+            "by default; if you're invoking the script outside an Action, "
+            "export GITHUB_TOKEN manually."
+        )
     url = f"https://api.github.com{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
@@ -598,8 +624,19 @@ def prepare_workdir(target: Target) -> Path:
     when the action lives in a separate controller repo).
     """
     workdir = Path(tempfile.mkdtemp(prefix=f"rr-{slugify(target.repo)}-"))
-    token = os.environ["GITHUB_TOKEN"]
-    repo_url = f"https://{token}@github.com/{target.repo}.git"
+    token = _github_token()
+    if not token:
+        raise RuntimeError(
+            "No GitHub token available for clone+push. Either pass "
+            "`with: github-token: ${{ secrets.MY_PAT }}` or rely on the "
+            "default ${{ github.token }} the action.yml threads through."
+        )
+    # Use the modern github.com auth convention: token as the `x-access-token`
+    # user. This is more portable across the workflow GITHUB_TOKEN (which
+    # works fine with the bare-token-as-username form too) and PATs (which
+    # work either way), avoiding any ambiguity that left the clone URL
+    # credential-less on the v1.0.3 push failure.
+    repo_url = f"https://x-access-token:{token}@github.com/{target.repo}.git"
 
     log.info(f"  → cloning {target.repo} to {workdir}")
     subprocess.run(["git", "clone", "--depth", "20", repo_url, str(workdir)], check=True)
