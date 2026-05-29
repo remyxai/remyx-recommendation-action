@@ -88,10 +88,16 @@ TIER_RANK = {"high": 3, "moderate": 2, "low": 1, "noise": 0, "near-random": 0}
 # existing files (e.g. a 3-line hook in evaluation.py). The post-hoc
 # check_integration() validator caps how much can change per existing
 # file and rejects runs that only add freestanding modules.
+# Python source anywhere in the repo is editable: a wiring edit has to be
+# able to reach the real call site, which often lives outside the target
+# package (a pipeline/stage driver, an entrypoint module, etc.), and we
+# don't want to hard-code any one repo's directory layout. Infra files that
+# happen to sit alongside source — container builds, shell scripts,
+# dependency/build manifests, CI config — are blocked by ROLE in
+# ALWAYS_BLOCKED, which takes precedence. The 50-line edit cap and the
+# invocation check in check_integration() keep edits surgical and honest.
 DEFAULT_ALLOWLIST_GLOBS = [
-    "{package}/*.py",
-    "{package}/**/*.py",
-    "tests/**/*.py",
+    "*.py",
     ".remyx-recommendation/**",
     "README.md",
 ]
@@ -116,16 +122,28 @@ BUNDLE_DIR_NAME = ".remyx-recommendation"
 BRANCH_PREFIX = "remyx-recommendation/"
 PR_TITLE_PREFIX = "[Remyx Recommendation]"
 
-# Paths that are NEVER allowed to be touched (CI-affecting + dependency files)
+# Files that are NEVER allowed to be touched. Blocked by ROLE (filename /
+# type), not by directory, so the policy doesn't encode any one repo's
+# layout: a Dockerfile is off-limits whether it sits at the root, under
+# docker/, or anywhere else. `*` crosses `/` in path_matches_glob, so each
+# pattern catches the file at the repo root and nested at any depth. This
+# is checked before the allowlist and takes precedence, so even though
+# `*.py` is allowlisted, build scripts and dependency manifests stay
+# protected. (Replaces the old directory-based `docker/**` / `pipelines/**`
+# / `config/**` blanket blocks, which were overfit to one repo's tree and
+# locked out the stage drivers that are often the real call site.)
 ALWAYS_BLOCKED = [
-    ".github/**",
-    "docker/**",
-    "pipelines/**",
-    "config/**",
-    "requirements.txt",
+    ".github/**",            # CI / workflow config (GitHub-standard location)
+    "*Dockerfile",           # container build recipes, anywhere
+    "*Dockerfile.*",
+    "*.dockerfile",
+    "*.sh",                  # shell scripts (entrypoints, build hooks), anywhere
+    "*requirements*.txt",    # pip dependency manifests, anywhere
     "setup.py",
+    "setup.cfg",
     "pyproject.toml",
     "MANIFEST.in",
+    "*.lock",                # lockfiles (poetry.lock, uv.lock, …)
 ]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -419,21 +437,27 @@ Markdown fences, no prose before or after. Schema:
                    concretely implemented in your diff>],
   "stubbed":     [<bullets describing what from the paper is left out,
                    with required infra noted in parentheses>],
-  "call_site":   "<which existing file the new code is wired into, or
-                   '(none)' if there is no integration edit>",
-  "can_be_deleted": <true if removing your diff would NOT break or
-                    alter any existing functionality in the repo;
-                    false if removing it would lose integrated
-                    behavior>,
+  "call_site":   "<which existing entry point the new code is invoked
+                   from, or '(none)' if nothing in the product calls it>",
+  "is_orphan":   <true if the new code is NOT reached from any pre-existing
+                   execution path — no production / pipeline entry point
+                   and no existing module invokes it (only the tests you
+                   added, if any, call it). This is about REACHABILITY, not
+                   quality: rich, correct code that the product never calls
+                   is still an orphan. Do NOT use this field to judge
+                   whether the code is "too simple" — triviality is scored
+                   separately by stub density.>,
   "honest_summary": "<one short paragraph: what you actually built,
                      what's missing, whether the paper's primary
                      contribution is really present>"
 }
 
-Be ruthless. If your new module is freestanding and never called from
-existing code, set can_be_deleted=true. If you only implemented the
-plumbing around the paper's contribution but not the contribution
-itself, list those parts as stubbed.
+Be ruthless about reachability. If the only thing that calls your new code
+is a test you added (or nothing at all), set is_orphan=true — the product
+never exercises it. If a pre-existing entry point (a pipeline/stage driver,
+a CLI, an existing module) now invokes your new code, set is_orphan=false.
+Separately, if you only implemented the plumbing around the paper's
+contribution but not the contribution itself, list those parts as stubbed.
 
 --- Diff ---
 
@@ -1092,8 +1116,13 @@ def changed_files(workdir: Path) -> list[str]:
     Without this filter, pytest's bytecode cache shows up as 'untracked'
     files in git status and gets the run rejected for path-allowlist
     violations even though Claude never intentionally wrote them."""
+    # --untracked-files=all lists individual files inside a newly-created
+    # directory instead of collapsing them to "newdir/". Without it, a new
+    # file in a brand-new dir (e.g. a first-ever tests/ folder) shows up as
+    # the directory, which the path-allowlist and integration/invocation
+    # checks can't reason about per-file.
     result = subprocess.run(
-        ["git", "status", "--porcelain"],
+        ["git", "status", "--porcelain", "--untracked-files=all"],
         cwd=workdir, capture_output=True, text=True, check=True,
     )
     paths = []
@@ -1172,62 +1201,99 @@ def _diff_line_changes(workdir: Path, path: str) -> tuple[int, int]:
     return added, deleted
 
 
-def _module_import_referenced(content: str, package: str, file_path: str) -> bool:
-    """True if `content` plausibly imports the module at `file_path`.
+def _head_source(workdir: Path, path: str) -> str:
+    """Source of `path` at HEAD, or '' if it didn't exist there."""
+    r = subprocess.run(
+        ["git", "show", f"HEAD:{path}"],
+        cwd=workdir, capture_output=True, text=True, check=False,
+    )
+    return r.stdout if r.returncode == 0 else ""
 
-    `file_path` is like 'vqasynth/cot_grounding_check.py' or
-    'vqasynth/subpkg/foo.py'. We accept any of:
 
-      - from {package}[.subpkg].{stem} import ...
-      - import {package}[.subpkg].{stem}
-      - from {package}[.subpkg] import ... {stem} ...
-      - from .[.subpkg].{stem} import ...
-      - from .[.subpkg] import ... {stem} ...
+def _public_callables(src: str) -> set[str]:
+    """Names of public functions, methods, and classes defined in `src`.
+
+    Methods are included by their bare name because an invocation
+    `obj.method(...)` is matched on the attribute name (see _called_names).
+    Underscore-prefixed names are treated as private and ignored.
     """
-    if not file_path.endswith(".py"):
-        return False
-    stem = Path(file_path).stem
-    if stem == "__init__":
-        return False
-    pkg_re = re.escape(package)
-    stem_re = re.escape(stem)
-    patterns = [
-        rf"\bfrom\s+{pkg_re}(?:\.[\w.]+)?\.{stem_re}\s+import\b",
-        rf"\bimport\s+{pkg_re}(?:\.[\w.]+)?\.{stem_re}\b",
-        rf"\bfrom\s+{pkg_re}(?:\.[\w.]+)?\s+import\s+[^\n]*\b{stem_re}\b",
-        rf"\bfrom\s+\.[\w.]*{stem_re}\s+import\b",
-        rf"\bfrom\s+\.[\w.]*\s+import\s+[^\n]*\b{stem_re}\b",
-    ]
-    return any(re.search(p, content) for p in patterns)
+    names: set[str] = set()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return names
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if not node.name.startswith("_"):
+                names.add(node.name)
+    return names
+
+
+def _called_names(src: str) -> set[str]:
+    """Names appearing in a call position in `src`: `foo(...)` yields
+    'foo', `obj.foo(...)` yields 'foo'."""
+    called: set[str] = set()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return called
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            if isinstance(fn, ast.Name):
+                called.add(fn.id)
+            elif isinstance(fn, ast.Attribute):
+                called.add(fn.attr)
+    return called
+
+
+def _added_callables(workdir: Path, path: str) -> set[str]:
+    """Public callables defined in the working-tree `path` that were not
+    defined at HEAD — the functions / methods / classes this diff adds."""
+    if not path.endswith(".py"):
+        return set()
+    try:
+        current = (workdir / path).read_text()
+    except OSError:
+        return set()
+    now = _public_callables(current)
+    if _file_is_new(workdir, path):
+        return now
+    return now - _public_callables(_head_source(workdir, path))
 
 
 def check_integration(
     workdir: Path, target: Target, package: str
 ) -> tuple[bool, list[str]]:
-    """Reject scaffold-shaped runs.
+    """Reject scaffold-shaped runs — code that's added but never called.
 
     Pass criteria — ALL of:
       * Number of new .py files under {package}/ ≤ MAX_NEW_PACKAGE_FILES.
       * Each modified existing file's net change ≤
         MAX_LINES_PER_EXISTING_FILE lines.
-      * If any new .py file was added under {package}/, at least one
-        modified existing file in {package}/ (not a test, not __init__)
-        must import or reference it.
+      * If the diff adds any new public function / method / class, at least
+        one of them must be INVOKED from a different changed file. This
+        proves the new code is wired into a call site rather than merely
+        defined — and it covers both shapes: a brand-new module (called
+        from a modified existing file) and methods/functions bolted onto an
+        existing file (called from elsewhere in the diff). An import alone
+        no longer counts; there must be an actual call.
+
+    A newly-added symbol can only be reached by code also added/modified in
+    this run (otherwise it would have been a NameError before), so scanning
+    the changed set is sufficient. A test counts as a call site here — the
+    code at least runs; whether a *production* path reaches it is the
+    self-review reachability pass's job (§4).
 
     Returns (passed, [violations]).
     """
     paths = changed_files(workdir)
     pkg_prefix = f"{package}/"
 
-    new_pkg_files: list[str] = []
-    mod_pkg_files: list[str] = []
-    for p in paths:
-        if not (p.startswith(pkg_prefix) and p.endswith(".py")):
-            continue
-        if _file_is_new(workdir, p):
-            new_pkg_files.append(p)
-        else:
-            mod_pkg_files.append(p)
+    new_pkg_files = [
+        p for p in paths
+        if p.startswith(pkg_prefix) and p.endswith(".py") and _file_is_new(workdir, p)
+    ]
 
     violations: list[str] = []
 
@@ -1241,43 +1307,44 @@ def check_integration(
         if _file_is_new(workdir, p):
             continue
         added, deleted = _diff_line_changes(workdir, p)
-        total = added + deleted
-        if total > MAX_LINES_PER_EXISTING_FILE:
+        if added + deleted > MAX_LINES_PER_EXISTING_FILE:
             violations.append(
                 f"oversized edit to existing file {p}: +{added}/-{deleted} "
                 f"> {MAX_LINES_PER_EXISTING_FILE}"
             )
 
-    if new_pkg_files:
-        if not mod_pkg_files:
+    # Invocation check. Every newly-added callable, keyed by the file that
+    # defines it, must be called from some OTHER changed file.
+    changed_py = [p for p in paths if p.endswith(".py")]
+    added_by_file: dict[str, set[str]] = {}
+    for p in changed_py:
+        added = _added_callables(workdir, p)
+        if added:
+            added_by_file[p] = added
+
+    if added_by_file:
+        calls_by_file: dict[str, set[str]] = {}
+        for p in changed_py:
+            try:
+                calls_by_file[p] = _called_names((workdir / p).read_text())
+            except OSError:
+                continue
+        integrated: set[str] = set()
+        for def_file, names in added_by_file.items():
+            for call_file, calls in calls_by_file.items():
+                if call_file == def_file:
+                    continue
+                integrated |= names & calls
+        if not integrated:
+            all_added = sorted({n for ns in added_by_file.values() for n in ns})
+            shown = ", ".join(all_added[:8]) + ("…" if len(all_added) > 8 else "")
             violations.append(
-                f"new module(s) {new_pkg_files} added but no existing file in "
-                f"{package}/ was modified — no integration point. Either wire "
-                f"the new module into an existing call site or open as Issue."
+                f"none of the newly-added functions/methods/classes are "
+                f"invoked from another changed file — the diff defines code "
+                f"nothing calls ({shown}). Wire the new capability into a "
+                f"real call site (an existing module, a stage driver, or at "
+                f"least a test that exercises it) or open as Issue."
             )
-        else:
-            for new_p in new_pkg_files:
-                referenced = False
-                for mod_p in mod_pkg_files:
-                    if mod_p.endswith("/__init__.py"):
-                        # __init__ re-exports don't prove the new code is
-                        # actually called. Continue looking for a real
-                        # call-site import.
-                        continue
-                    try:
-                        content = (workdir / mod_p).read_text()
-                    except OSError:
-                        continue
-                    if _module_import_referenced(content, package, new_p):
-                        referenced = True
-                        break
-                if not referenced:
-                    violations.append(
-                        f"new module {new_p} is not imported by any modified "
-                        f"existing file in {package}/ (other than __init__). "
-                        f"Add a wiring edit at a real call site or open as "
-                        f"Issue."
-                    )
 
     return (not violations, violations)
 
@@ -1642,12 +1709,13 @@ def process_target(target: Target) -> dict:
         issue_opened_preflight            — pre-flight (§6) routed to Issue
                                             before invoking implementation
         issue_opened                      — Claude wrote OPEN_AS_ISSUE.md
-        issue_opened_no_integration       — integration validator (§2) rejected
+        issue_opened_no_integration       — integration validator (§2): the
+                                            diff adds code nothing invokes
         issue_opened_stub_density         — stub-density validator (§3) rejected
         issue_opened_no_test_integration  — test gate (§3) found no test that
                                             imports an existing module
-        issue_opened_self_review          — self-review (§4) says diff can be
-                                            deleted with no functional loss
+        issue_opened_self_review          — self-review (§4): new code is an
+                                            orphan, unreachable from production
 
         rejected_path_violations          — Claude touched out-of-bounds paths
         skipped_test_failure              — draft_mode=never and tests failed
@@ -1856,25 +1924,28 @@ def process_target(target: Target) -> dict:
             return result
 
         # 9. Self-review (§4). Second Claude pass over the diff. Renders
-        # a "What this PR actually does" section into the PR body; if it
-        # judges the diff deletable with no loss, routes to Issue.
+        # a "What this PR actually does" section into the PR body; if the
+        # new code is an orphan (unreachable from any production path), it
+        # routes to Issue. This is a REACHABILITY check, not a triviality
+        # one — stub density (§3) already covers "the code is too thin".
         review = self_review_diff(workdir)
         result["self_review"] = review or {}
-        if review and review.get("can_be_deleted") is True:
+        if review and review.get("is_orphan") is True:
             log.warning(
-                "  ✗ self-review says diff is deletable with no loss; "
-                "downgrading to Issue"
+                "  ✗ self-review: new code is unreachable from any "
+                "production path (orphan); downgrading to Issue"
             )
             summary = review.get("honest_summary") or ""
             issue_url = _open_downgrade_issue(
                 target, rec,
-                reason="Self-review judged the diff deletable with no loss",
+                reason="Self-review judged the new code an orphan (no production call path)",
                 detail=(
                     "On a second pass over the diff, the coding agent "
-                    "concluded that removing the changes would not "
-                    "break or alter existing functionality. That's the "
-                    "definition of an orphan scaffold — routing to "
-                    "Issue.\n\n"
+                    "concluded that no pre-existing entry point or module "
+                    "invokes the new code — at most its own tests call it. "
+                    "That's an orphan: the product never exercises it. "
+                    "(This is about reachability, not whether the code is "
+                    "trivial — stub density is judged separately.)\n\n"
                     f"_Self-review summary: {summary}_"
                 ),
             )

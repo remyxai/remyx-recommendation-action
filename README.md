@@ -111,10 +111,10 @@ Visit your repo's **Actions** tab → **Remyx Recommendation** → **Run workflo
 | `pr_opened_draft` | PR opened as draft (the default under `draft-mode: always`, or when tests failed under `draft-mode: on_test_failure`) |
 | `issue_opened_preflight` | Pre-flight Claude pass routed to Issue **before** spending the implementation budget (paper needs infra the repo lacks, or no clear call site) |
 | `issue_opened` | Claude elected Issue-mode during implementation (wrote `OPEN_AS_ISSUE.md` instead of code) |
-| `issue_opened_no_integration` | New module(s) added but no existing file was modified to wire them in — orphan scaffold detected |
+| `issue_opened_no_integration` | The diff adds functions/methods/classes that nothing invokes — code defined but never called from any other changed file (an import alone doesn't count) |
 | `issue_opened_stub_density` | New module's public surface is dominated by `pass` / `raise NotImplementedError` / empty bodies (≥50% of function bodies are stubs) |
 | `issue_opened_no_test_integration` | New tests only self-test the new file; no new test imports from a pre-existing module |
-| `issue_opened_self_review` | Second Claude pass over the diff concluded the changes are deletable with no functional loss |
+| `issue_opened_self_review` | Second Claude pass judged the new code an **orphan** — unreachable from any production path (at most its own tests call it). This is a reachability check, not a triviality one (stub density covers triviality) |
 | `skipped_low_confidence` | Recommendation below `min-confidence` |
 | `skipped_rate_limit` | A previous Remyx PR was opened within `rate-limit-days` |
 | `skipped_pr_exists` | An open PR for this exact paper already exists |
@@ -126,18 +126,21 @@ Visit your repo's **Actions** tab → **Remyx Recommendation** → **Run workflo
 ## Guardrails — what Claude can and can't modify
 
 Allowed paths (defaults):
-- `<package>/**/*.py` — any module in your target package (new or existing, so Claude can add the wiring edit at the call site)
-- `tests/**/*.py` — any test file
+- `*.py` — any Python source anywhere in the repo (new or existing). The wiring edit has to reach the *real* call site, which often lives outside the target package — a pipeline/stage driver, an entrypoint module, etc. — so the allowlist isn't tied to one repo's directory layout.
 - `.remyx-recommendation/**` — the spec bundle (scrubbed before commit, never lands in the PR)
 - `README.md` — append-only attribution section
 
-Always blocked:
-- `.github/**`, `docker/**`, `pipelines/**`, `config/**`
-- `requirements.txt`, `setup.py`, `pyproject.toml`, `MANIFEST.in`
+Always blocked — by **role** (filename/type), not by directory, so the policy doesn't encode any one repo's tree. `*` crosses `/`, so each pattern matches at the repo root and nested at any depth:
+- `.github/**` — CI / workflow config
+- `*Dockerfile`, `*Dockerfile.*`, `*.dockerfile`, `*.sh` — container builds and shell scripts, wherever they live
+- `*requirements*.txt`, `setup.py`, `setup.cfg`, `pyproject.toml`, `MANIFEST.in`, `*.lock` — dependency / build manifests
+
+This block list takes precedence over the allowlist, so even though `*.py` is allowed, infra stays protected. Non-`.py` config that isn't on the block list (e.g. `pipelines/*.yaml`) simply isn't in the allowlist, so it can't be touched either.
 
 Edit-size caps (post-hoc, enforced after the Claude session):
 - Each edit to a pre-existing file is capped at **50 net lines** (additions + deletions). Larger edits get rejected — wiring is expected to be surgical.
 - At most **3 new `.py` files** under the target package per run.
+- At least one newly-added function/method/class must be **invoked** from another changed file (an import alone isn't enough) — otherwise the diff is code nothing calls.
 
 If Claude touches anything outside the allowed set, the action rejects the run and does not open a PR. Use the `guardrails-allowlist` input to extend the allowed set for your repo.
 
