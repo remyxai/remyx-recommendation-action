@@ -50,6 +50,24 @@ inputs:
       .remyx-recommendation/**, README.md). Most repos won't need this.
     required: false
     default: ''
+  lookback:
+    description: |
+      Recommendation lookback window. The action pulls the candidate pool
+      over this window, then a Claude selection pass picks the candidate
+      most directly implementable against the target repo (relevance rank
+      alone often surfaces a model-architecture paper with no call site).
+      One of: "today" | "week" | "month". Default: "week" (past 7 days).
+    required: false
+    default: 'week'
+  candidate-pool:
+    description: |
+      How many recommendations to pull into the selection pool over the
+      lookback window. The selection pass picks the most implementable
+      one; the rest are recorded as "rejected" with a reason. Default 25
+      (the API returns up to whatever Remyx retains for the interest, so
+      a larger pool just widens the window the selection pass sees).
+    required: false
+    default: '25'
 
 outputs:
   status:
@@ -120,5 +138,10 @@ runs:
         INPUT_DRAFT_MODE: ${{ inputs.draft-mode }}
         INPUT_RATE_LIMIT_DAYS: ${{ inputs.rate-limit-days }}
         INPUT_GUARDRAILS_ALLOWLIST: ${{ inputs.guardrails-allowlist }}
+        # Lookback window + pool size for the candidate selection pass.
+        # run.py reads these directly (not via INPUT_*) — they default to
+        # week / 10 in run.py too, so omitting them is safe.
+        REMYX_RECOMMENDATION_PERIOD: ${{ inputs.lookback }}
+        REMYX_RECOMMENDATION_LIMIT: ${{ inputs.candidate-pool }}
       run: |
         python ${{ github.action_path }}/src/run.py

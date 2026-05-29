@@ -66,7 +66,7 @@ from typing import Any
 
 REMYX_API_BASE = os.environ.get("REMYX_API_BASE", "https://engine.remyx.ai")
 REMYX_RECOMMENDATION_PERIOD = os.environ.get("REMYX_RECOMMENDATION_PERIOD", "week")
-REMYX_RECOMMENDATION_LIMIT = int(os.environ.get("REMYX_RECOMMENDATION_LIMIT", "10"))
+REMYX_RECOMMENDATION_LIMIT = int(os.environ.get("REMYX_RECOMMENDATION_LIMIT", "25"))
 
 # Map Remyx's 0.0-1.0 relevance_score onto confidence-gate tiers.
 # Thresholds are intentionally generous on the high end since the action
@@ -402,6 +402,52 @@ __SPEC__
 __LAYOUT__
 """
 
+_SELECTION_PROMPT_TEMPLATE = """\
+You are selecting which paper recommendation the Remyx Recommendation
+orchestrator should implement as a draft PR against the target repo.
+
+You are given a ranked list of candidate papers (ranked by Remyx
+relevance, highest first) and the target repo's module layout. Relevance
+rank is NOT implementability: the top-ranked paper is frequently a model
+architecture or a training method with no call site in a data / inference
+pipeline, while a lower-ranked candidate is a clean drop-in.
+
+Pick the ONE candidate that is most directly implementable as a focused
+PR against THIS repo. Prefer a candidate that:
+  - maps onto an existing module / call site visible in the layout,
+  - is a pipeline / data-generation / eval change the repo can actually
+    host (not a new trainer, model architecture, or checkpoint the repo
+    has no loader for),
+  - ships its contribution as code this repo would call, rather than a
+    freestanding module nothing imports.
+
+Down-rank candidates whose primary contribution is a model to be trained,
+an architecture, or anything needing infrastructure absent from the
+layout — even when they rank higher by relevance.
+
+Output a single JSON object. Start with `{` and end with `}`. No Markdown
+fences, no prose before or after. Schema:
+
+{
+  "chosen_index": <integer index into the candidate list below>,
+  "reasoning": "<2-3 sentences: why this candidate is the most directly
+                 implementable against this repo, naming the call site>",
+  "rejected": [
+    {"index": <int>, "why": "<one line: why this candidate is a worse fit
+                              to implement now, e.g. needs a trainer the
+                              repo lacks>"}
+  ]
+}
+
+--- Candidates (highest relevance first) ---
+
+__CANDIDATES__
+
+--- Repo layout (top-level modules in the target package + tests) ---
+
+__LAYOUT__
+"""
+
 _SELF_REVIEW_PROMPT_TEMPLATE = """\
 You are reviewing your own implementation of a paper recommendation
 before the orchestrator opens a PR.
@@ -441,7 +487,7 @@ __DIFF__
 """
 
 _PR_BODY_TEMPLATE = """\
-> **Drafted by an autonomous discovery loop** — Remyx ranks recent arXiv papers against this team's research interest and shipping history; Claude Code implements the top pick.
+> **Drafted by an autonomous discovery loop** — Remyx ranks recent arXiv papers against this team's research interest and shipping history; Claude Code selects the candidate most directly implementable against this repo from the lookback window and drafts it.
 >
 > **Recommended paper**: [{paper_title}](https://arxiv.org/abs/{arxiv_id})
 > **Confidence**: {tier_emoji} {tier} (Remyx relevance {relevance_score:.2f})
@@ -453,7 +499,7 @@ _PR_BODY_TEMPLATE = """\
 ## Why this paper for this team
 
 {reasoning}
-
+{selection_section}
 ## Suggested experiment
 
 {suggested_experiment}
@@ -632,12 +678,71 @@ def _relevance_to_tier(score: float) -> str:
     return "noise"
 
 
-def query_remyx_recommendation(target: Target) -> Recommendation:
-    """Pull the top recommendation for ``target.interest_id`` from the
-    Remyx engine. Replaces the previous Gemini-direct path — Remyx now
-    owns commit-history extraction, candidate pool, embedding pre-filter,
-    Gemini ranking, and reasoning generation. The action is a pure
-    consumer.
+def _fetch_interest_context(interest_id: str) -> tuple[str, str]:
+    """Fetch the interest's name + rich-text focus body once per run.
+
+    Returns (interest_name, interest_context). The context body is the
+    rich text the customer wrote on engine.remyx.ai about their research
+    focus / goals — it gives Claude Code a far better picture of what to
+    build than the paper abstract + reasoning alone. Best-effort: on any
+    failure we return empty strings and fall back to the reasoning-only
+    brief.
+    """
+    try:
+        interest = _remyx_get(f"/api/v1.0/research-interests/{interest_id}")
+        return (
+            (interest.get("name") or ""),
+            (interest.get("context") or "").strip(),
+        )
+    except Exception as e:
+        log.warning(f"    (interest context fetch failed: {e}; "
+                    f"continuing with reasoning-only brief)")
+        return "", ""
+
+
+def _paper_to_recommendation(
+    paper: dict, fallback_interest_name: str, interest_context: str
+) -> Recommendation:
+    """Map one /papers/recommended envelope entry to a Recommendation."""
+    relevance = float(paper.get("relevance_score") or 0.0)
+    resource = paper.get("resource") or {}
+    arxiv_id = paper.get("resource_id") or resource.get("arxiv_id") or ""
+    abstract = (resource.get("abstract") or resource.get("summary") or "").strip()
+    return Recommendation(
+        paper_title=paper.get("title") or "(untitled)",
+        arxiv_id=arxiv_id,
+        tier=_relevance_to_tier(relevance),
+        z_score=0.0,                       # legacy field, unused
+        spec_md="",                        # legacy; rendered from fields below
+        paper_abstract=abstract,
+        team_context="",                   # Remyx keeps team context server-side
+        domain_summary="",
+        raw_paper_md="",
+        relevance_score=relevance,
+        reasoning=(paper.get("reasoning") or "").strip(),
+        suggested_experiment=(paper.get("suggested_experiment") or "").strip(),
+        recommendation_id=paper.get("recommendation_id") or "",
+        interest_name=paper.get("interest_name") or fallback_interest_name,
+        interest_context=interest_context,
+    )
+
+
+def query_remyx_candidates(target: Target) -> list[Recommendation]:
+    """Pull the top-N recommendations for ``target.interest_id`` over the
+    configured lookback window and return them as a relevance-ranked list.
+
+    The window is ``REMYX_RECOMMENDATION_PERIOD`` (default ``"week"`` — the
+    past 7 days) and the pool size is ``REMYX_RECOMMENDATION_LIMIT``
+    (default 25), both surfaced as the ``lookback`` / ``candidate-pool``
+    action inputs. Remyx owns commit-history extraction, candidate pool,
+    embedding pre-filter, Gemini ranking, and reasoning generation; the
+    action is a pure consumer.
+
+    The earlier behaviour took only ``papers[0]``, which wasted the
+    lookback: the top-ranked paper is often a model-architecture or
+    training-method paper with no call site in a data-pipeline repo, while
+    a lower-ranked candidate is a clean drop-in. Returning the full pool
+    lets ``select_recommendation`` pick the most implementable candidate.
 
     See ``GET /api/v1.0/papers/recommended`` in remyxai/remyx
     (engine/app/api/papers.py).
@@ -651,7 +756,9 @@ def query_remyx_recommendation(target: Target) -> Recommendation:
         )
 
     log.info(f"  → querying Remyx /papers/recommended "
-             f"(interest={target.interest_id[:8]}…)")
+             f"(interest={target.interest_id[:8]}…, "
+             f"period={REMYX_RECOMMENDATION_PERIOD}, "
+             f"limit={REMYX_RECOMMENDATION_LIMIT})")
     resp = _remyx_get(
         "/api/v1.0/papers/recommended",
         params={
@@ -670,52 +777,25 @@ def query_remyx_recommendation(target: Target) -> Recommendation:
             f"/api/v1.0/papers/recommended/refresh first."
         )
 
-    # Pick the highest-scoring recommendation that isn't already in flight.
-    # Existing-PR dedup runs LATER in process_target — here we just take the
-    # top of the list and let the dedup gate skip if needed.
-    top = papers[0]
-    relevance = float(top.get("relevance_score") or 0.0)
-    tier = _relevance_to_tier(relevance)
+    interest_name, interest_context = _fetch_interest_context(target.interest_id)
+    candidates = [
+        _paper_to_recommendation(p, interest_name, interest_context)
+        for p in papers
+    ]
+    for i, c in enumerate(candidates):
+        log.info(f"    [{i}] {c.paper_title[:55]}…  "
+                 f"relevance={c.relevance_score:.2f}  tier={c.tier}")
+    return candidates
 
-    resource = top.get("resource") or {}
-    arxiv_id = top.get("resource_id") or resource.get("arxiv_id") or ""
-    abstract = (resource.get("abstract") or resource.get("summary") or "").strip()
 
-    # Fetch the interest's full context body — the rich text the customer
-    # wrote on engine.remyx.ai about their research focus / goals. This
-    # gives Claude Code a far better picture of what to build than the
-    # paper abstract + recommendation reasoning alone.
-    interest_name = top.get("interest_name") or ""
-    interest_context = ""
-    try:
-        interest = _remyx_get(f"/api/v1.0/research-interests/{target.interest_id}")
-        interest_context = (interest.get("context") or "").strip()
-        if not interest_name:
-            interest_name = interest.get("name") or ""
-    except Exception as e:
-        log.warning(f"    (interest context fetch failed: {e}; "
-                    f"continuing with reasoning-only brief)")
+def query_remyx_recommendation(target: Target) -> Recommendation:
+    """Back-compat shim: the single highest-ranked recommendation.
 
-    log.info(f"    ✓ {top.get('title','?')[:60]}…  "
-             f"relevance={relevance:.2f}  tier={tier}")
-
-    return Recommendation(
-        paper_title=top.get("title") or "(untitled)",
-        arxiv_id=arxiv_id,
-        tier=tier,
-        z_score=0.0,                       # legacy field, unused
-        spec_md="",                        # legacy; rendered from fields below
-        paper_abstract=abstract,
-        team_context="",                   # Remyx keeps team context server-side
-        domain_summary="",
-        raw_paper_md="",
-        relevance_score=relevance,
-        reasoning=(top.get("reasoning") or "").strip(),
-        suggested_experiment=(top.get("suggested_experiment") or "").strip(),
-        recommendation_id=top.get("recommendation_id") or "",
-        interest_name=interest_name,
-        interest_context=interest_context,
-    )
+    Retained for callers / tests that only want the top pick. The
+    orchestrator now calls ``query_remyx_candidates`` and runs a
+    selection pass over the full pool instead.
+    """
+    return query_remyx_candidates(target)[0]
 
 
 
@@ -997,6 +1077,75 @@ def preflight_routing(
         return None
     data["decision"] = decision
     log.info(f"  pre-flight decision: {decision} — "
+             f"{(data.get('reasoning') or '')[:120]}")
+    return data
+
+
+def _render_candidate_brief(candidates: list[Recommendation]) -> str:
+    """Numbered, relevance-ranked brief of the candidate pool for the
+    selection pass. Index matches list position so the model's
+    ``chosen_index`` maps straight back."""
+    blocks: list[str] = []
+    for i, c in enumerate(candidates):
+        abstract = " ".join((c.paper_abstract or "").split())
+        blocks.append(
+            f"[{i}] {c.paper_title}  "
+            f"(arxiv {c.arxiv_id or 'n/a'}, relevance {c.relevance_score:.2f}, "
+            f"tier {c.tier})\n"
+            f"    why surfaced: {(c.reasoning or '(none)')[:600]}\n"
+            f"    abstract: {abstract[:400]}"
+        )
+    return "\n\n".join(blocks)
+
+
+def select_recommendation(
+    workdir: Path, package: str, candidates: list[Recommendation],
+    timeout_s: int = 180,
+) -> dict | None:
+    """Claude pass that picks the most implementable candidate from the
+    lookback pool, given the target repo's module layout.
+
+    Returns the parsed JSON ({chosen_index, reasoning, rejected}) or None
+    on any failure (single candidate, parse error, out-of-range index,
+    timeout, missing CLI). On None the caller falls back to candidates[0]
+    (the highest-ranked), preserving the pre-selection behaviour.
+
+    This only chooses *which* candidate to implement — it never decides
+    PR vs Issue. The chosen candidate still runs the full preflight +
+    integration / stub / test / self-review gate chain, any of which can
+    downgrade to an Issue.
+    """
+    if len(candidates) <= 1:
+        return None
+    layout = _repo_layout_manifest(workdir, package)
+    prompt = (
+        _SELECTION_PROMPT_TEMPLATE
+        .replace("__CANDIDATES__", _render_candidate_brief(candidates))
+        .replace("__LAYOUT__", layout)
+    )
+    log.info(f"  → selection pass over {len(candidates)} candidates")
+    ok, output = _run_claude_oneshot(workdir, prompt, timeout_s)
+    if not ok:
+        log.warning(f"  selection call failed: {output[:200]}; "
+                    f"falling back to top-ranked candidate")
+        return None
+    data = _extract_json_object(output)
+    if data is None:
+        log.warning(f"  selection: couldn't parse JSON; raw: {output[:300]!r}")
+        return None
+    try:
+        idx = int(data.get("chosen_index"))
+    except (TypeError, ValueError):
+        log.warning(f"  selection: chosen_index not an int "
+                    f"({data.get('chosen_index')!r}); falling back")
+        return None
+    if not (0 <= idx < len(candidates)):
+        log.warning(f"  selection: chosen_index {idx} out of range "
+                    f"[0,{len(candidates)}); falling back")
+        return None
+    data["chosen_index"] = idx
+    log.info(f"  selection: candidate [{idx}] "
+             f"{candidates[idx].paper_title[:50]}… — "
              f"{(data.get('reasoning') or '')[:120]}")
     return data
 
@@ -1657,38 +1806,85 @@ def process_target(target: Target) -> dict:
     """
     result: dict = {"repo": target.repo, "status": "unknown"}
 
-    # 1+2. Query + gate
-    rec = query_remyx_recommendation(target)
-    result.update({
-        "paper": rec.paper_title,
-        "arxiv": rec.arxiv_id,
-        "tier": rec.tier,
-    })
-    log.info(f"  ✓ recommendation: [{rec.tier}] {rec.paper_title}")
-
-    min_required = TIER_RANK.get(target.min_confidence.lower(), 2)
-    actual = TIER_RANK.get(rec.tier.lower(), 0)
-    if actual < min_required:
-        result["status"] = "skipped_low_confidence"
-        log.info(f"  ✗ tier {rec.tier} below min {target.min_confidence}; skipping")
-        return result
-
-    # 3. Dedup
+    # 1. Rate-limit (per-repo) — cheapest gate, before any candidate work
+    #    or checkout.
     if recent_pr_within_rate_limit(target):
         result["status"] = "skipped_rate_limit"
         return result
 
-    branch = f"{BRANCH_PREFIX}{rec.arxiv_id or slugify(rec.paper_title)}"
-    if existing_pr_for(target, branch):
-        result["status"] = "skipped_pr_exists"
-        log.info(f"  ✗ PR already exists for branch {branch}; skipping")
+    # 2. Query the candidate pool over the lookback window (default: the
+    #    past week). The old flow took only papers[0], wasting the
+    #    lookback; we keep the whole pool so the selection pass can pick
+    #    the most implementable candidate.
+    candidates = query_remyx_candidates(target)
+    result["candidates_returned"] = len(candidates)
+
+    # 3. Per-candidate gates. Drop anything below the confidence tier or
+    #    already in flight (an open PR for its branch) so the selection
+    #    pass only sees viable candidates. Running this BEFORE the clone
+    #    preserves the "don't check out the repo if nothing is actionable"
+    #    optimization the single-pick flow had.
+    min_required = TIER_RANK.get(target.min_confidence.lower(), 2)
+    viable: list[Recommendation] = []
+    dropped_low_conf = 0
+    dropped_pr_exists = 0
+    for c in candidates:
+        if TIER_RANK.get(c.tier.lower(), 0) < min_required:
+            dropped_low_conf += 1
+            continue
+        c_branch = f"{BRANCH_PREFIX}{c.arxiv_id or slugify(c.paper_title)}"
+        if existing_pr_for(target, c_branch):
+            dropped_pr_exists += 1
+            continue
+        viable.append(c)
+
+    if not viable:
+        # Nothing actionable. Prefer the more specific skip reason: if the
+        # only thing stopping us is dedup, say so; otherwise it's the tier.
+        if dropped_pr_exists and not dropped_low_conf:
+            result["status"] = "skipped_pr_exists"
+            log.info(f"  ✗ all {dropped_pr_exists} candidate(s) already "
+                     f"have open PRs; skipping")
+        else:
+            result["status"] = "skipped_low_confidence"
+            log.info(f"  ✗ no candidate at/above min {target.min_confidence} "
+                     f"({dropped_low_conf} below tier, "
+                     f"{dropped_pr_exists} already in flight); skipping")
         return result
 
-    # 4-5. Workdir + spec bundle
+    log.info(f"  ✓ {len(viable)} viable candidate(s) "
+             f"(dropped {dropped_low_conf} low-confidence, "
+             f"{dropped_pr_exists} already in flight)")
+
+    # 4. Workdir + selection. Clone first (the selection pass needs the
+    #    repo's module layout), then let Claude pick the candidate most
+    #    directly implementable against this repo. Selection only chooses
+    #    WHICH paper — the PR-vs-Issue decision stays with the gates below.
     workdir = prepare_workdir(target)
     try:
         package = detect_package_name(workdir)
         log.info(f"  detected package: {package}")
+
+        selection = select_recommendation(workdir, package, viable)
+        if selection is not None:
+            rec = viable[selection["chosen_index"]]
+            result["selection_reasoning"] = selection.get("reasoning", "")
+            result["selection_rejected"] = selection.get("rejected", [])
+        else:
+            rec = viable[0]
+            result["selection_reasoning"] = (
+                "(selection pass unavailable — used top-ranked candidate)"
+            )
+        result.update({
+            "paper": rec.paper_title,
+            "arxiv": rec.arxiv_id,
+            "tier": rec.tier,
+            "candidates_considered": len(viable),
+        })
+        log.info(f"  ✓ selected: [{rec.tier}] {rec.paper_title}")
+
+        # 5. Spec bundle for the chosen candidate.
+        branch = f"{BRANCH_PREFIX}{rec.arxiv_id or slugify(rec.paper_title)}"
         write_spec_bundle(workdir, target, rec, package)
 
         # 5.5. Pre-flight Issue routing (§6). Cheap Claude pass that
@@ -1900,6 +2096,7 @@ def process_target(target: Target) -> dict:
         pr_body = build_pr_body(
             target, rec, tests_passed, test_output,
             review_section=review_section,
+            selection_note=result.get("selection_reasoning", ""),
         )
         commit_and_push(workdir, branch, pr_title)
         pr_url = open_pr(target, branch, pr_title, pr_body, draft=draft)
@@ -1920,6 +2117,7 @@ def build_pr_body(
     tests_passed: bool,
     test_output: str,
     review_section: str = "",
+    selection_note: str = "",
 ) -> str:
     tier_emoji = {"high": "🟢", "moderate": "🟡", "low": "🟠", "noise": "🔴"}.get(rec.tier, "⚪")
     test_section_inner = (
@@ -1935,6 +2133,15 @@ def build_pr_body(
         if review_section else
         test_section_inner
     )
+    # Selection rationale: why this candidate was picked from the lookback
+    # pool over higher-ranked ones. Empty (just the section break) when the
+    # pool had one candidate or the selection pass was unavailable.
+    selection_section = (
+        f"\n## Why this candidate (selected from the lookback pool)\n\n"
+        f"{selection_note}\n"
+        if selection_note and not selection_note.startswith("(")
+        else "\n"
+    )
     return _PR_BODY_TEMPLATE.format(
         paper_title=rec.paper_title,
         arxiv_id=rec.arxiv_id,
@@ -1943,6 +2150,7 @@ def build_pr_body(
         relevance_score=rec.relevance_score,
         interest_name=rec.interest_name or "(unnamed)",
         reasoning=rec.reasoning or "(no reasoning provided)",
+        selection_section=selection_section,
         suggested_experiment=rec.suggested_experiment or "(none)",
         test_section=test_section,
         attribution_url=CANONICAL_ATTRIBUTION_URL,

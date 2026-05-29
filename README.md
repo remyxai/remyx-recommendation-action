@@ -12,13 +12,15 @@ A composite GitHub Action that, on a schedule you choose, picks the next arXiv p
 
 Each scheduled run:
 
-1. Queries `engine.remyx.ai` for the top-ranked paper against your team's configured `ResearchInterest` (Remyx already knows your repo's commit history and codifies what your team has been building).
+1. Queries `engine.remyx.ai` for the candidate pool against your team's configured `ResearchInterest` over the `lookback` window (default: the past week), then runs a Claude **selection pass** that picks the candidate most directly implementable against *your* repo. Relevance rank alone often surfaces a model-architecture or training-method paper with no call site in a data/inference pipeline, while a lower-ranked candidate is a clean drop-in — the selection pass reads your repo's module layout and chooses accordingly (Remyx already knows your repo's commit history and codifies what your team has been building).
 2. Either:
    - Opens a **draft pull request** that adds a small capability-named module AND wires it into an existing call site in your package, with a self-review section in the PR body honestly noting what was implemented vs. left out, OR
    - Opens an **Issue** with the paper's details and a discussion of what would block a clean integration — when the paper doesn't fit (pre-flight, validators, or self-review route it to discussion instead of a PR).
 3. Reports outputs (`status`, `pr_url`, `issue_url`, `arxiv`, `tier`) you can chain into downstream steps.
 
 The orchestrator defaults to opening Issues, not PRs. A PR is only opened when the implementation wires new code into an existing module, passes a stub-density check, has at least one test that imports from a pre-existing module, and survives a self-review pass over the diff. This makes PRs ready-to-ship rather than scaffold-shaped.
+
+The selection pass only chooses *which* candidate to implement — it never decides PR vs Issue. The selected candidate still runs the full pre-flight + integration / stub / test / self-review gate chain, so if even the best-fit candidate can't be cleanly implemented, it's routed to an Issue exactly as before.
 
 ## Setup (5 minutes)
 
@@ -92,6 +94,8 @@ Visit your repo's **Actions** tab → **Remyx Recommendation** → **Run workflo
 | `draft-mode` | `always` | PR-draft policy: `always` (default), `on_test_failure`, or `never`. |
 | `rate-limit-days` | `7` | Skip if a previous Remyx PR was opened within this window. Set `0` to rely only on per-paper dedup. |
 | `guardrails-allowlist` | `''` | Comma-separated extra path globs Claude Code may modify (most repos don't need this). |
+| `lookback` | `week` | Recommendation lookback window: `today` / `week` / `month`. The candidate pool is pulled over this window before the selection pass. |
+| `candidate-pool` | `25` | How many recommendations to pull into the selection pool. The selection pass picks the most implementable one; the rest are recorded as rejected with a reason. |
 
 ## Outputs
 
