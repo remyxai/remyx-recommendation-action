@@ -1263,10 +1263,25 @@ def changed_files(workdir: Path) -> list[str]:
 
 
 def path_matches_glob(path: str, patterns: list[str]) -> bool:
-    """Simple glob matcher: ** matches any path, * matches one segment."""
+    """Simple glob matcher. `**` matches any number of path segments,
+    INCLUDING zero; `*` matches within a segment.
+
+    fnmatch alone treats `*` as crossing `/`, so `tests/**/*.py` only
+    matches when there's at least one intermediate dir — it rejects a
+    top-level `tests/test_foo.py`, which is exactly the shape the §3 test
+    gate expects. We test three normalizations per pattern so the
+    zero-segment case matches too:
+      - the raw pattern,
+      - `**` → `*`            (collapse to single star),
+      - `**/` → ``            (drop the segment entirely, so
+                               `tests/**/*.py` also matches `tests/x.py`).
+    """
     import fnmatch
-    return any(fnmatch.fnmatch(path, p) or fnmatch.fnmatch(path, p.replace("**", "*"))
-               for p in patterns)
+    for p in patterns:
+        variants = {p, p.replace("**", "*"), p.replace("**/", "")}
+        if any(fnmatch.fnmatch(path, v) for v in variants):
+            return True
+    return False
 
 
 def validate_changes(workdir: Path, target: Target, package: str) -> tuple[bool, list[str]]:
