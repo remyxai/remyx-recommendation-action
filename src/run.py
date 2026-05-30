@@ -1054,7 +1054,17 @@ def prepare_workdir(target: Target) -> Path:
     repo_url = f"https://x-access-token:{token}@github.com/{target.repo}.git"
 
     log.info(f"  → cloning {target.repo} to {workdir}")
-    subprocess.run(["git", "clone", "--depth", "20", repo_url, str(workdir)], check=True)
+    # Skip Git-LFS smudge: the orchestrator only reads code structure and
+    # makes small edits — it never needs the LFS blobs (model weights,
+    # datasets). Fetching them is slow, and a repo whose LFS bandwidth
+    # budget is exhausted fails the clone outright ("exceeded its LFS
+    # budget") even though every file we touch is plain text. Pointer files
+    # are checked out instead.
+    clone_env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+    subprocess.run(
+        ["git", "clone", "--depth", "20", repo_url, str(workdir)],
+        check=True, env=clone_env,
+    )
     subprocess.run(
         ["git", "config", "user.email", "remyx-recommendation@noreply.remyx.ai"],
         cwd=workdir, check=True,
